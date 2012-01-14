@@ -9,7 +9,7 @@
 --
 -- This simplifies asynchronous I/O by making send and receive operations seem
 -- atomic.  If a thread is thrown an exception while reading from or writing to
--- a TChan, the transaction will be rolled back thanks to STM.  Only if the
+-- a TChan, the transaction will be rolled back thanks to STM.  Only if the
 -- connection takes too long to respond during shutdown will a transmission be
 -- truncated.
 --
@@ -17,7 +17,8 @@
 
 {-# LANGUAGE DeriveDataTypeable #-}
 module Control.Concurrent.STM.Channelize (
-    channelize
+    channelize,
+    ChannelizeException(..),
 ) where
 
 import Control.Concurrent
@@ -35,6 +36,8 @@ instance Show ChannelizeException where
     show (RecvError e) = "channelize: receive error: " ++ show e
     show (SendError e) = "channelize: send error: "    ++ show e
 
+instance Exception ChannelizeException
+
 -- | Turn a network connection's send and receive actions into a pair of 'TChan's.
 --
 -- More precisely, spawn two threads:
@@ -48,12 +51,12 @@ instance Show ChannelizeException where
 -- connection will be closed.  Subsequent use of the channels will block and/or
 -- leak memory.
 --
--- If either the receive callback or send callback encounter an exception, it
+-- If either the receive callback or send callback encounters an exception, it
 -- will be wrapped in a 'ChannelizeException' and thrown to your thread.
 --
 -- It is guaranteed that:
 --
---  * The receive callback is only called from thread (1)
+--  * The receive callback is only called from thread (1).
 --
 --  * The send callback is only called from thread (2).
 --
