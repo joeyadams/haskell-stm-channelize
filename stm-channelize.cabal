@@ -20,4 +20,4 @@ library
     build-depends:      base == 4.*
                       , stm
     ghc-options:        -Wall
-    other-extensions:   DeriveDataTypeable
+    other-extensions:   CPP, DeriveDataTypeable

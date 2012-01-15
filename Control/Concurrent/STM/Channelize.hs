@@ -2,7 +2,7 @@
 -- Module:      Control.Concurrent.STM.Channelize
 -- Copyright:   (c) Joseph Adams 2012
 -- Maintainer:  joeyadams3.14159@gmail.com
--- Portability: Requires STM, DeriveDataTypeable
+-- Portability: Requires STM, CPP, DeriveDataTypeable
 --
 -- Wrap a network connection such that sending and receiving can be done via
 -- channels in STM.
@@ -15,7 +15,7 @@
 --
 -- TODO: Add support for bounded-tchan.
 
-{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE CPP, DeriveDataTypeable #-}
 module Control.Concurrent.STM.Channelize (
     channelize,
     ChannelizeException(..),
@@ -23,7 +23,7 @@ module Control.Concurrent.STM.Channelize (
 
 import Control.Concurrent
 import Control.Concurrent.STM
-import Control.Exception
+import Control.Exception as E
 import Control.Monad
 import Data.Typeable
 
@@ -75,15 +75,11 @@ channelize recv send close inner = do
     recv_stopped    <- newTVarIO False
     send_stopped    <- newTVarIO False
 
-    let recvThread send_tid = do
-            undefined
+    caller_tid <- myThreadId
 
-        sendThread recv_tid = do
-            undefined
-
+    let
         -- recvLoop and sendLoop terminate without exception if they detect
         -- that the stop variable is set.
-
         recvLoop = do
             msg <- recv
             checkVar stop (writeTVar recv_stopped True) $ do
@@ -97,12 +93,84 @@ channelize recv send close inner = do
                     send msg
                     sendLoop
 
+        recvThread send_tid =
+            portableMask $ \restore -> do
+                restore recvLoop `catch` \e -> 
+
+        sendThread recv_tid = do
+            undefined
+
     (recv_tid, send_tid) <- forkIO_pair recvThread sendThread
 
     undefined
 
 ------------------------------------------------------------------------
 -- Internal helpers
+
+data ExceptionSinkStatus
+    = Inside
+    | Throwing
+    | Threw
+    | Outside
+
+-- | Run an action, passing it an action that throws an exception at the
+-- current thread.  However, the exception will be discarded if control has
+-- left 'withExceptionSink'.
+withExceptionSink :: ((SomeException -> IO ()) -> IO a)
+                  -> IO a
+withExceptionSink inner = do
+    tid <- myThreadId
+    status_var <- newTVarIO Inside
+
+    let throwToInner e = join $ atomically $ do
+            status <- readTVar status_var
+            case status of
+                Inside -> do
+                    writeTVar status_var Throwing
+                    return $ do
+                        throwTo tid e
+
+
+    inner throwToInner
+
+    finally:
+        Leaving
+
+type ThrowToMe = SomeException -> IO ()
+
+-- | Create a function that throws an exception to the current thread.  Ensure
+-- that if the exception throwing function is called after the inner
+-- computation has completed, the exception will be discarded.
+withExceptionBarrier :: (ThrowToMe -> IO a) -- Inner computation
+                     -> IO b                -- Finalizer
+                     -> IO a
+withExceptionBarrier inner finalizer = do
+    finished <- newTVarIO False
+    me <- myThreadId
+
+    let throwToMe e = do
+            f <- atomically $ readTVar finished
+            when (not f) $ throwTo me e
+
+    inner throwToMe `finally` atomically (writeTVar finished True)
+
+-- Make sure that:
+--
+--  * If the exception thrower itself encounters an exception, it does not
+--    leave the exception lock in an invalid state.
+--
+--  * When the receiving thread sees that an exception is coming, it needs to
+--    wait for it.  However, if the thrower doesn't successfully get the
+--    exception out, it must wake the receiving thread so it stops waiting for
+--    an exception.
+--
+--  * If another exception is thrown at the receiving thread, it must still
+--    mark that it has completed and run the finalizer.
+--
+--  * Extra safety: make sure withExceptionBarrier still works if run within
+--    mask, and make sure 'throwToMe' can be called from the same thread as is
+--    being thrown to.
+
 
 -- | Spawn two threads, passing them each other's thread IDs.
 forkIO_pair :: (ThreadId -> IO ())
@@ -156,3 +224,18 @@ checkVar var on_set or_else =
                 then on_set >> return (return ())
                 else retry
         ) `orElse` or_else
+
+-- | Like 'E.mask', but backported to base before version 4.3.0.
+--
+-- Note that the restore callback is monomorphic, unlike in 'E.mask'.  This
+-- could be fixed by changing the type signature, but it would require us to
+-- enable the RankNTypes extension.  This module doesn't need that
+-- polymorphism, anyway.
+portableMask :: ((IO a -> IO a) -> IO b) -> IO b
+#if MIN_VERSION_base(4,3,0)
+portableMask io = E.mask $ \restore -> io restore
+#else
+portableMask io = do
+    b <- E.blocked
+    E.block $ io $ \m -> if b then m else E.unblock m
+#endif
