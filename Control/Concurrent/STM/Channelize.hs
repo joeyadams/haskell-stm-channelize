@@ -103,6 +103,41 @@ channelize recv send close inner = do
 
     undefined
 
+
+------------------------------------------------------------------------
+-- Gate
+
+-- | A special type of mutex used to prevent send and receive threads from
+-- throwing exceptions at the caller thread after 'channelize' has completed.
+newtype Gate = Gate (MVar Bool)
+
+-- | Create a new, open gate.
+newGate :: IO Gate
+newGate = Gate <$> newMVar True
+
+-- | Perform an action, but only if the gate is open.
+whenGateIsOpen :: Gate -> IO () -> IO ()
+whenGateIsOpen (Gate gate) action =
+    withMVar gate $ \open ->
+        if open
+            then action
+            else return ()
+
+-- | Close the gate.  This will never throw an exception.  If any asynchronous
+-- exceptions are received during the operation, the first one is returned.
+--
+-- This must be run within an asynchronous exception 'mask'.
+closeGate :: Gate -> IO (Maybe SomeException)
+closeGate (Gate gate) = loop maybe_ex
+    where
+        loop maybe_ex = do
+            takeMVar_ gate `E.catch` \ex -> loop (maybe_ex `mplus` Just ex)
+            putMVar gate False
+            return maybe_ex
+
+        takeMVar_ x = takeMVar x >> return ()
+
+
 ------------------------------------------------------------------------
 -- Internal helpers
 
