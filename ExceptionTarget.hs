@@ -4,96 +4,62 @@
 --
 -- > import ExceptionTarget (ExceptionTarget)
 -- > import qualified ExceptionTarget as ET
+
+{-# LANGUAGE ScopedTypeVariables #-}
 module ExceptionTarget (
     ExceptionTarget,
-    newExceptionTarget,
-    throwExceptionTarget,
-    pinchExceptionTarget,
-    withExceptionTarget,
+    new,
+    throw,
+    pinch,
 ) where
 
 import Control.Concurrent
-import Control.Exception hiding (throw)
-import Data.IORef
+import Control.Exception as E hiding (throw)
 
-data ExceptionTarget = ExceptionTarget ThreadId (MVar ()) (IORef Bool)
+data ExceptionTarget = ExceptionTarget ThreadId (MVar Bool)
 
 new :: IO ExceptionTarget
 new = do
-    my_tid   <- myThreadId
-    mutex    <- newMVar ()
-    finished <- newIORef False
-    return (ExceptionTarget my_tid mutex finished)
+    my_tid <- myThreadId
+    mutex  <- newMVar False
+    return $ ExceptionTarget my_tid mutex
 
 -- | If the target has been pinched, the exception will not be thrown.
 throw :: Exception e => ExceptionTarget -> e -> IO ()
+throw (ExceptionTarget tid mutex) ex =
+    mask_ $ do
+        pinched <- takeMVar mutex
+        if pinched
+            then return ()
+            else throwTo tid ex `onException` putMVar mutex pinched
+        putMVar mutex pinched
 
 -- | Prevent a thread from receiving any more exceptions through this
 -- ExceptionTarget.
+--
+-- Even if 'pinch' receives an asynchronous exception, it is guaranteed that the target thread will not 
 pinch :: ExceptionTarget -> IO ()
 pinch = mask_ . pinchBase
 
--- This must be run in an exception mask.
+-- | Variant of 'pinch' that must be run within an exception mask.
 pinchBase :: ExceptionTarget -> IO ()
-pinchBase (ExceptionTarget _ mutex finished) = do
-    -- Set the "finished" flag so 'throw' will stop throwing exceptions at us.
-    -- 'throw' may be about to throw us an exception, but this guarantees that
-    -- no calls to 'throw' after that will throw us an exception.
-    atomicModifyIORef finished (\_ -> (True, ()))
+pinchBase (ExceptionTarget _ mutex) = loop
+    where
+        -- Acquire the mutex and set the "pinched" flag, which is behind the
+        -- mutex.  If this fails (meaning we received an asynchronous
+        -- exception), try again.  Try as many times as it takes.  Propagate
+        -- the first exception we received (if any).
 
-    -- This sequence may look careless and naive, but:
-    --
-    --  * setFinished is called within an exception mask
-    --
-    --  * If takeMVar is interrupted, it will leave the MVar intact.
-    --    Otherwise, withMVar would not be exception-safe.
-    --
-    --  * The putMVar is not interruptible, because the MVar is
-    --    guaranteed to be empty after the takeMVar.
-    takeMVar mutex
-    putMVar mutex ()
+        loop :: IO ()
+        loop = do
+            (takeMVar mutex >> return ()) `E.catch` loopEx
+            putMVar mutex True
 
--- | Create a function that throws an exception to the current thread.  Ensure
--- that if the exception throwing function is called after the inner
--- computation has completed, the exception will be discarded.
-withExceptionBarrier :: ((SomeException -> IO ()) -> IO a)
-                     -> IO a
-withExceptionBarrier inner = do
-    mutex    <- newMVar ()
-    finished <- newIORef False
-    my_tid   <- myThreadId
-
-    let testFinished =
-            atomicModifyIORef finished (\f -> (f, f))
-
-        -- Set the 'finished' flag.  In case a 
-        setFinished = do
-            atomicModifyIORef finished (\_ -> (True, ()))
-
-            -- This sequence may look careless and naive, but:
-            --
-            --  * setFinished is called within an exception mask
-            --
-            --  * If takeMVar is interrupted, it will leave the MVar intact.
-            --    Otherwise, withMVar would not be exception-safe.
-            --
-            --  * The putMVar is not interruptible, because the MVar is
-            --    guaranteed to be empty after the takeMVar.
-            takeMVar mutex
-            putMVar mutex ()
-
-        throwToMe ex = mask_ $ do
-            takeMVar mutex
-            f <- testFinished
-            if f
-                then return ()
-                else throwTo my_tid ex `onException` putMVar mutex ()
-            putMVar mutex ()
-
-    mask $ \restore -> do
-        r <- restore (inner throwToMe) `onException` setFinished
-        setFinished
-        return r
+        loopEx :: SomeException -> IO ()
+        loopEx ex = do
+            (takeMVar mutex >> return ()) `E.catch` \(_ :: SomeException) -> loopEx ex
+            putMVar mutex True
+            throwIO ex
 
 -- Make sure that:
 --
