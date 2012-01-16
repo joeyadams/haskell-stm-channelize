@@ -18,8 +18,6 @@
 {-# LANGUAGE CPP, DeriveDataTypeable, ExistentialQuantification #-}
 module Control.Concurrent.STM.Channelize (
     Config(..),
-    SimpleConfig,
-    simpleConfig,
     channelize,
     ChannelizeException(..),
 ) where
@@ -41,38 +39,17 @@ instance Show ChannelizeException where
 
 instance Exception ChannelizeException
 
-data Config r s msg_in msg_out
+data Config msg_in msg_out
     = Config
-        { recvInit  :: r
-        , recvMsg   :: r -> IO (msg_in, r)
-            -- ^ Callback for receiving a message.  State is passed from one
-            -- call to the next.
-        , sendInit  :: s
-        , sendMsg   :: msg_out -> s -> IO s
-            -- ^ Callback for sending a message.  State is passed from one
-            -- call to the next.
-        , sendBye   :: s -> IO ()
+        { recvMsg   :: IO msg_in
+            -- ^ Callback for receiving a message.
+        , sendMsg   :: msg_out -> IO ()
+            -- ^ Callback for sending a message.
+        , sendBye   :: IO ()
             -- ^ Send action to call before closing the connection.
         , connClose :: IO ()
             -- ^ Callback for closing the connection.  Called when 'channelize'
             -- completes.
-        }
-
-type SimpleConfig msg_in msg_out = Config () () msg_in msg_out
-
-simpleConfig :: conn                        -- ^ Connection handle
-             -> (conn -> IO msg_in)         -- ^ Receive callback
-             -> (conn -> msg_out -> IO ())  -- ^ Send callback
-             -> (conn -> IO ())             -- ^ Close callback
-             -> SimpleConfig msg_in msg_out
-simpleConfig conn recv send close
-    = Config
-        { recvInit  = ()
-        , recvMsg   = \_state -> do { msg <- recv conn; return (msg, ()) }
-        , sendInit  = ()
-        , sendMsg   = \msg _state -> send conn msg
-        , sendBye   = \_state -> return ()
-        , connClose = close conn
         }
 
 -- | Turn a network connection's send and receive actions into a pair of 'TChan's.
