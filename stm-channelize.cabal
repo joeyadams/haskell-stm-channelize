@@ -17,7 +17,7 @@ extra-source-files:
 
 library
     exposed-modules:    Control.Concurrent.STM.Channelize
-    build-depends:      base == 4.*
+    build-depends:      base >= 4.3
                       , stm
     ghc-options:        -Wall
     other-extensions:   CPP, DeriveDataTypeable

@@ -48,6 +48,10 @@ instance Show ChannelizeException where
 
 instance Exception ChannelizeException
 
+data ChannelizeKill
+    = ChannelizeKill
+    deriving (Show, Typeable)
+
 data Config msg_in msg_out
     = Config
         { recvMsg   :: IO msg_in
@@ -113,6 +117,7 @@ channelize config inner = do
                 writeTChan recv_chan msg
                 return recvLoop
 
+        -- TODO: Do sendBye before marking send_stopped
         sendLoop =
             checkVar stop (writeTVar send_stopped True) $ do
                 msg <- readTChan send_chan
@@ -120,23 +125,52 @@ channelize config inner = do
                     sendMsg config msg
                     sendLoop
 
-        throwToCaller wrapper =
-            whenGateIsOpen caller_gate . throwTo caller_tid . wrapper
+        runLoop :: IO ()
+                -> (SomeException -> ChannelizeException)
+                -> TVar Bool
+                -> IO ThreadId
+        runLoop loop e_wrapper x_stopped =
+                forkIO $ mask $ \restore -> restore loop `catch` handler
+            where
+                handler e = do
+                    atomically $ writeTVar x_stopped True
+                    if fromException e == Just ChannelizeKill
+                        then return ()
+                        else whenGateIsOpen caller_gate $
+                                throwTo caller_tid $ e_wrapper e
 
-    recv_tid <- forkIO $ recvLoop `E.catch` throwToCaller RecvError
-    send_tid <- forkIO $ sendLoop `E.catch` throwToCaller SendError
+    mask $ \restore -> do
+        recv_tid <- restore $ runLoop recvLoop RecvError recv_stopped
+        send_tid <- restore $ runLoop sendLoop SendError send_stopped
 
-    _killer_tid <- forkIO $ do
-        waitFor stop
+        _killer_tid <- forkIO $ do
+            waitFor stop
 
-        undefined
+            -- Send ChannelizeKill to the receive thread immediately.
+            -- Unfortunately, we don't know whether it is polling or receiving
+            -- data.
+            throwTo recv_tid ChannelizeKill
 
-        undefined `finally` (atomically $ writeTVar killer_stopped True)
+            -- Wait for the send thread to get our message.  This will usually
+            -- succeed immediately, but if it takes too long, kill it.
+            --
+            -- Wait for the receive thread to finish being killed.  If it takes
+            -- too long, move on.
+            waitForDelay 1000000 [send_stopped, recv_stopped] $ do
+                throwTo send_tid ChannelizeKill
 
-    inner recv_chan send_chan `finally` do
+                -- Give the send thread one more chance to stop, so 'close' hopefully 
+
+            connClose config `finally` (atomically $ writeTVar killer_stopped True)
+
+        restore (inner recv_chan send_chan) `onException` do
+            atomically $ writeTVar stop True
+            closeGate caller_gate
+            waitFor killer_stopped
+
         atomically $ writeTVar stop True
+        waitFor killer_stopped `onException` closeGate caller_gate
         closeGate caller_gate
-        waitFor killer_stopped
 
 
 ------------------------------------------------------------------------
@@ -200,3 +234,9 @@ checkVar var on_set or_else =
                 else retry
         ) `orElse` or_else
 
+-- | Like 'onException', but provide the exception to the caller.
+onSomeException :: IO a -> (SomeException -> IO b) -> IO a
+onSomeException action handler =
+    action `catch` \e -> do
+        _ <- handler e
+        throwIO e
