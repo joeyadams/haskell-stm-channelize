@@ -26,6 +26,7 @@ import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Exception as E
 import Control.Monad
+import Data.IORef
 import Data.Typeable
 
 data ChannelizeException
@@ -42,11 +43,21 @@ instance Exception ChannelizeException
 data Config msg_in msg_out
     = Config
         { recvMsg   :: IO msg_in
-            -- ^ Callback for receiving a message.
         , sendMsg   :: msg_out -> IO ()
-            -- ^ Callback for sending a message.
+            -- ^ Callbacks for sending and receiving messages.  All calls of
+            -- 'recvMsg' will be in one thread, and all calls of 'sendMsg' will
+            -- be in another thread.  If 'recvMsg' throws an exception, it will
+            -- not be called again.  If 'sendMsg' throws an exception, it will
+            -- not be called again, nor will 'sendBye' be called.
+            --
+            -- This means it is safe to use an 'IORef' to pass state from one
+            -- 'recvMsg' or 'sendMsg' call to the next.  However, to share
+            -- state between 'recvMsg' and 'sendMsg', you will need to use
+            -- thread synchronization (e.g. 'MVar', 'STM').
         , sendBye   :: IO ()
-            -- ^ Send action to call before closing the connection.
+            -- ^ Action to call before closing the connection, but only if none
+            -- of the send calls failed.  This is called from the same thread
+            -- as 'sendMsg'.
         , connClose :: IO ()
             -- ^ Callback for closing the connection.  Called when 'channelize'
             -- completes.
