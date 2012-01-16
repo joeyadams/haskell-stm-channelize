@@ -113,7 +113,7 @@ newtype Gate = Gate (MVar Bool)
 
 -- | Create a new, open gate.
 newGate :: IO Gate
-newGate = Gate <$> newMVar True
+newGate = Gate `fmap` newMVar True
 
 -- | Perform an action, but only if the gate is open.
 whenGateIsOpen :: Gate -> IO () -> IO ()
@@ -128,14 +128,17 @@ whenGateIsOpen (Gate gate) action =
 --
 -- This must be run within an asynchronous exception 'mask'.
 closeGate :: Gate -> IO (Maybe SomeException)
-closeGate (Gate gate) = loop maybe_ex
+closeGate (Gate gate) =
+        loop Nothing
     where
-        loop maybe_ex = do
-            takeMVar_ gate `E.catch` \ex -> loop (maybe_ex `mplus` Just ex)
-            putMVar gate False
-            return maybe_ex
-
-        takeMVar_ x = takeMVar x >> return ()
+        loop prev_ex = do
+            e <- try (takeMVar gate)
+            case e of
+                Left ex ->
+                    loop (prev_ex `mplus` Just ex)
+                Right _ -> do
+                    putMVar gate False
+                    return prev_ex
 
 
 ------------------------------------------------------------------------
