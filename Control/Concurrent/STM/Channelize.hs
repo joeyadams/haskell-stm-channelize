@@ -93,9 +93,8 @@ channelize recv send close inner = do
                     send msg
                     sendLoop
 
-        recvThread send_tid =
-            portableMask $ \restore -> do
-                restore recvLoop `catch` \e -> 
+        recvThread send_tid = do
+            undefined
 
         sendThread recv_tid = do
             undefined
@@ -106,70 +105,6 @@ channelize recv send close inner = do
 
 ------------------------------------------------------------------------
 -- Internal helpers
-
-data ExceptionSinkStatus
-    = Inside
-    | Throwing
-    | Threw
-    | Outside
-
--- | Run an action, passing it an action that throws an exception at the
--- current thread.  However, the exception will be discarded if control has
--- left 'withExceptionSink'.
-withExceptionSink :: ((SomeException -> IO ()) -> IO a)
-                  -> IO a
-withExceptionSink inner = do
-    tid <- myThreadId
-    status_var <- newTVarIO Inside
-
-    let throwToInner e = join $ atomically $ do
-            status <- readTVar status_var
-            case status of
-                Inside -> do
-                    writeTVar status_var Throwing
-                    return $ do
-                        throwTo tid e
-
-
-    inner throwToInner
-
-    finally:
-        Leaving
-
-type ThrowToMe = SomeException -> IO ()
-
--- | Create a function that throws an exception to the current thread.  Ensure
--- that if the exception throwing function is called after the inner
--- computation has completed, the exception will be discarded.
-withExceptionBarrier :: (ThrowToMe -> IO a) -- Inner computation
-                     -> IO b                -- Finalizer
-                     -> IO a
-withExceptionBarrier inner finalizer = do
-    finished <- newTVarIO False
-    me <- myThreadId
-
-    let throwToMe e = do
-            f <- atomically $ readTVar finished
-            when (not f) $ throwTo me e
-
-    inner throwToMe `finally` atomically (writeTVar finished True)
-
--- Make sure that:
---
---  * If the exception thrower itself encounters an exception, it does not
---    leave the exception lock in an invalid state.
---
---  * When the receiving thread sees that an exception is coming, it needs to
---    wait for it.  However, if the thrower doesn't successfully get the
---    exception out, it must wake the receiving thread so it stops waiting for
---    an exception.
---
---  * If another exception is thrown at the receiving thread, it must still
---    mark that it has completed and run the finalizer.
---
---  * Extra safety: make sure withExceptionBarrier still works if run within
---    mask, and make sure 'throwToMe' can be called from the same thread as is
---    being thrown to.
 
 
 -- | Spawn two threads, passing them each other's thread IDs.

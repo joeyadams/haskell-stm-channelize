@@ -17,6 +17,9 @@ extra-source-files:
 
 library
     exposed-modules:    Control.Concurrent.STM.Channelize
+
+    other-modules:      ExceptionTarget
+
     build-depends:      base == 4.*
                       , stm
     ghc-options:        -Wall
