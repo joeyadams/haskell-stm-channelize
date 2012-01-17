@@ -19,5 +19,5 @@ library
     exposed-modules:    Control.Concurrent.STM.Channelize
     build-depends:      base >= 4.3
                       , stm
-    ghc-options:        -Wall
+    ghc-options:        -Wall -fno-warn-unused-imports
     other-extensions:   CPP, DeriveDataTypeable

@@ -5,46 +5,34 @@
 -- Portability: base >= 4.3
 --
 -- Wrap a network connection such that sending and receiving can be done via
--- channels in STM.
---
--- This simplifies asynchronous I/O by making send and receive operations seem
--- atomic.  If a thread is thrown an exception while reading from or writing to
--- a 'TChan', the transaction will be rolled back thanks to STM.  Only if the
--- connection takes too long to respond during shutdown will a transmission be
--- truncated.
---
--- TODO: Add support for bounded-tchan.
+-- STM transactions.
 
 {-# LANGUAGE CPP, DeriveDataTypeable #-}
 module Control.Concurrent.STM.Channelize (
-    Config(..),
+    ChannelizeConfig(..),
+    connectStdio,
+    connectHandle,
     channelize,
     ChannelizeException(..),
-
-    -- * Custom channel types
-    -- | You may want to use a different type of channel than 'TChan' (e.g.
-    -- TBChan in the stm-chans package).  'TChan' places no limit on the queue
-    -- length, so your application may start leaking memory if a client
-    -- produces messages faster than they can be consumed.
-    --
-    -- TODO
 ) where
 
+import Prelude hiding (catch)
 import Control.Concurrent
 import Control.Concurrent.STM
-import Control.Exception as E
+import Control.Exception
 import Control.Monad
 import Data.IORef
 import Data.Typeable
+import System.IO
 
 data ChannelizeException
-    = RecvError SomeException
-    | SendError SomeException
+    = ChannelizeClosedRecv
+    | ChannelizeClosedSend
     deriving Typeable
 
 instance Show ChannelizeException where
-    show (RecvError e) = "channelize: receive error: " ++ show e
-    show (SendError e) = "channelize: send error: "    ++ show e
+    show ChannelizeClosedRecv = "channelize: receive callback used after connection was closed"
+    show ChannelizeClosedSend = "channelize: send callback used after connection was closed"
 
 instance Exception ChannelizeException
 
@@ -52,8 +40,14 @@ data ChannelizeKill
     = ChannelizeKill
     deriving (Show, Typeable)
 
-data Config msg_in msg_out
-    = Config
+instance Exception ChannelizeKill
+
+data WorkerStatus = Running
+                  | Stopped
+                  | Error SomeException
+
+data ChannelizeConfig msg_in msg_out
+    = ChannelizeConfig
         { recvMsg   :: IO msg_in
         , sendMsg   :: msg_out -> IO ()
             -- ^ Callbacks for sending and receiving messages.  All calls of
@@ -75,176 +69,125 @@ data Config msg_in msg_out
             -- completes.
         }
 
--- | Turn a network connection's send and receive actions into a pair of 'TChan's.
---
--- More precisely, spawn two threads:
---
---  (1) Receive messages from the connection and write them to the first channel.
---
---  (2) Read messages from the second channel and send them to the connection.
---
--- Run the inner computation, passing it these channels.  When the computation
--- completes (or throws an exception), sending and receiving will stop, and the
--- connection will be closed.  Subsequent use of the channels will block and/or
--- leak memory.
---
--- If either the receive callback or send callback encounters an exception, it
--- will be wrapped in a 'ChannelizeException' and thrown to your thread.
---
--- Before returning, 'channelize' will wait for sending and receiving to stop, and for 
-channelize :: Config msg_in msg_out
-                -- ^ Callbacks for sending and receiving on the connection, and
-                -- for closing the connection
-           -> (TChan msg_in -> TChan msg_out -> IO a)
-                -- ^ Inner computation
+connectStdio :: IO (ChannelizeConfig String String)
+connectStdio = do
+    hSetBuffering stdin LineBuffering
+    hSetBuffering stdout LineBuffering
+    return ChannelizeConfig
+        { recvMsg   = getLine
+        , sendMsg   = putStrLn
+        , sendBye   = return ()
+        , connClose = return ()
+        }
+
+connectHandle :: IO Handle -> IO (ChannelizeConfig String String)
+connectHandle connect = do
+    h <- connect
+    hSetBuffering h LineBuffering `onException` hClose h
+    return ChannelizeConfig
+        { recvMsg   = hGetLine h
+        , sendMsg   = hPutStrLn h
+        , sendBye   = return ()
+        , connClose = hClose h
+        }
+
+channelize :: (IO (ChannelizeConfig msg_in msg_out))
+                -- ^ Connect action.  It is run inside of an asynchronous
+                --   exception 'mask'.
+           -> (STM msg_in -> (msg_out -> STM ()) -> IO a)
            -> IO a
-channelize config inner = do
-    recv_chan       <- newTChanIO
-    send_chan       <- newTChanIO
-    stop            <- newTVarIO False
-    recv_stopped    <- newTVarIO False
-    send_stopped    <- newTVarIO False
-    killer_stopped  <- newTVarIO False
-    caller_tid      <- myThreadId
-    caller_gate     <- newGate
+channelize connect inner = do
+    chan_recv   <- newTChanIO
+    chan_send   <- newTChanIO
+    stop        <- newTVarIO False
+    recv_status <- newTVarIO Running
+    send_status <- newTVarIO Running
 
-    let recvLoop = do
-            msg <- recvMsg config
-            join $ atomically $ do
-                s <- readTVar stop
-                if s
-                    then do
-                        writeTVar recv_stopped True
-                        return $ return ()
-                    else do
-                        writeTChan recv_chan msg
-                        return recvLoop
+    let recv = readTChan chan_recv `orElse` do
+            s <- readTVar recv_status
+            case s of
+                Running -> retry
+                Stopped -> throwSTM ChannelizeClosedRecv
+                Error e -> throwSTM e
 
-        sendLoop = join $ atomically $ do
-            s <- readTVar stop
-            if s
-                then return $ do
-                    sendBye config
-                    atomically $ writeTVar send_stopped True
-                else do
-                    msg <- readTChan send_chan
-                    return $ do
-                        sendMsg config msg
-                        sendLoop
-
-        runLoop :: IO ()
-                -> (SomeException -> ChannelizeException)
-                -> TVar Bool
-                -> IO ThreadId
-        runLoop loop e_wrapper x_stopped =
-                forkIO $ mask $ \restore -> restore loop `catch` handler
-            where
-                handler e = do
-                    atomically $ writeTVar x_stopped True
-                    if fromException e == Just ChannelizeKill
-                        then return ()
-                        else whenGateIsOpen caller_gate $
-                                throwTo caller_tid $ e_wrapper e
+        send msg = do
+            s <- readTVar send_status
+            case s of
+                Running -> writeTChan chan_send msg
+                Stopped -> throwSTM ChannelizeClosedSend
+                Error e -> throwSTM e
 
     mask $ \restore -> do
-        recv_tid <- restore $ runLoop recvLoop RecvError recv_stopped
-        send_tid <- restore $ runLoop sendLoop SendError send_stopped
+        config <- connect
 
-        _killer_tid <- forkIO $ do
-            waitFor stop
+        let recvLoop = do
+                msg <- recvMsg config
+                join $ atomically $ do
+                    s <- readTVar stop
+                    if s
+                        then do
+                            writeTVar recv_status Stopped
+                            return $ return ()
+                        else do
+                            writeTChan chan_recv msg
+                            return recvLoop
 
-            -- Send ChannelizeKill to the receive thread immediately.
-            -- Unfortunately, we don't know whether it is polling or receiving
-            -- data.
-            throwTo recv_tid ChannelizeKill
+            sendLoop = join $ atomically $ do
+                s <- readTVar stop
+                if s
+                    then return $ do
+                        sendBye config
+                        atomically $ writeTVar send_status Stopped
+                    else do
+                        msg <- readTChan chan_send
+                        return $ do
+                            sendMsg config msg
+                            sendLoop
 
-            -- Wait for the send thread to get our message.  This will usually
-            -- succeed immediately, but if it takes too long, kill it.
-            --
-            -- Wait for the receive thread to finish being killed.  If it takes
-            -- too long, move on.
-            waitForDelay 1000000 [send_stopped, recv_stopped] $ do
-                throwTo send_tid ChannelizeKill
+            setError status_var e =
+                case fromException e of
+                    Just ChannelizeKill -> writeTVar status_var Stopped
+                    _                   -> writeTVar status_var $ Error e
 
-            -- Ensure that no sending or receiving will happen at the same time as connClose.
-            waitFor [send_stopped, recv_stopped]
+        recver <- forkIO $ recvLoop
+                    `catch` (atomically . setError recv_status)
 
-            connClose config `finally` (atomically $ writeTVar killer_stopped True)
+        sender <- forkIO $ sendLoop
+                    `catch` (atomically . setError send_status)
 
-        restore (inner recv_chan send_chan) `onException` do
-            atomically $ writeTVar stop True
-            closeGate caller_gate
-            waitFor killer_stopped
+        let finish = do
+                atomically $ writeTVar stop True
+                _ <- forkIO $ killSenderAfter 1000000
+                throwTo recver ChannelizeKill `finally` waitForWorkers
+                                              `finally` connClose config
 
-        atomically $ writeTVar stop True
-        waitFor killer_stopped `onException` closeGate caller_gate
-        closeGate caller_gate
+            killSenderAfter usec = do
+                -- I would use 'registerDelay', but it requires -threaded
+                timeout <- newTVarIO False
+                _ <- forkIO $ do
+                    threadDelay usec
+                    atomically $ writeTVar timeout True
 
+                join $ atomically $ do
+                    s <- readTVar send_status
+                    case s of
+                        Running -> do
+                            t <- readTVar timeout
+                            if t
+                                then return $ throwTo sender ChannelizeKill
+                                else retry
+                        _ ->
+                            -- Sender thread stopped.  Don't kill it.
+                            return $ return ()
 
-------------------------------------------------------------------------
--- Gate
+            waitForWorkers = atomically $ do
+                r <- readTVar recv_status
+                s <- readTVar send_status
+                case (r, s) of
+                    (Running, _) -> retry
+                    (_, Running) -> retry
+                    _            -> return ()
 
--- | A special type of mutex used to prevent send and receive threads from
--- throwing exceptions at the caller thread after 'channelize' has completed.
-newtype Gate = Gate (MVar Bool)
-
--- | Create a new, open gate.
-newGate :: IO Gate
-newGate = Gate `fmap` newMVar True
-
--- | Perform an action, but only if the gate is open.
-whenGateIsOpen :: Gate -> IO () -> IO ()
-whenGateIsOpen (Gate gate) action =
-    withMVar gate $ \open ->
-        if open
-            then action
-            else return ()
-
--- | Close the gate.  This will never throw an exception.  If any asynchronous
--- exceptions are received during the operation, the first one is returned.
---
--- This must be run within an asynchronous exception 'mask'.
-closeGate :: Gate -> IO (Maybe SomeException)
-closeGate (Gate gate) =
-        loop Nothing
-    where
-        loop prev_ex = do
-            e <- try (takeMVar gate)
-            case e of
-                Left ex ->
-                    loop (prev_ex `mplus` Just ex)
-                Right _ -> do
-                    putMVar gate False
-                    return prev_ex
-
-
-------------------------------------------------------------------------
--- Miscellaneous helpers
-
--- | Wait for the TVar's value to become 'True'.
-waitFor :: TVar Bool -> IO ()
-waitFor var = atomically $ do
-    v <- readTVar var
-    if v
-        then return ()
-        else retry
-
--- | If var is True, call on_set.  Otherwise, run or_else followed by the IO
--- action it returns.
---
--- If or_else retries, check var again.
-checkVar :: TVar Bool -> STM () -> STM (IO ()) -> IO ()
-checkVar var on_set or_else =
-    join $ atomically $
-        (do v <- readTVar var
-            if v
-                then on_set >> return (return ())
-                else retry
-        ) `orElse` or_else
-
--- | Like 'onException', but provide the exception to the caller.
-onSomeException :: IO a -> (SomeException -> IO b) -> IO a
-onSomeException action handler =
-    action `catch` \e -> do
-        _ <- handler e
-        throwIO e
+        r <- restore (inner recv send) `onException` finish
+        finish
+        return r
