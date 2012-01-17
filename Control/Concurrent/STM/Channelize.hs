@@ -9,7 +9,7 @@
 --
 -- This simplifies asynchronous I/O by making send and receive operations seem
 -- atomic.  If a thread is thrown an exception while reading from or writing to
--- a TChan, the transaction will be rolled back thanks to STM.  Only if the
+-- a 'TChan', the transaction will be rolled back thanks to STM.  Only if the
 -- connection takes too long to respond during shutdown will a transmission be
 -- truncated.
 --
@@ -108,22 +108,29 @@ channelize config inner = do
     caller_tid      <- myThreadId
     caller_gate     <- newGate
 
-    let
-        -- recvLoop and sendLoop terminate without exception if they detect
-        -- that the stop variable is set.
-        recvLoop = do
+    let recvLoop = do
             msg <- recvMsg config
-            checkVar stop (writeTVar recv_stopped True) $ do
-                writeTChan recv_chan msg
-                return recvLoop
+            join $ atomically $ do
+                s <- readTVar stop
+                if s
+                    then do
+                        writeTVar recv_stopped True
+                        return $ return ()
+                    else do
+                        writeTChan recv_chan msg
+                        return recvLoop
 
-        -- TODO: Do sendBye before marking send_stopped
-        sendLoop =
-            checkVar stop (writeTVar send_stopped True) $ do
-                msg <- readTChan send_chan
-                return $ do
-                    sendMsg config msg
-                    sendLoop
+        sendLoop = join $ atomically $ do
+            s <- readTVar stop
+            if s
+                then return $ do
+                    sendBye config
+                    atomically $ writeTVar send_stopped True
+                else do
+                    msg <- readTChan send_chan
+                    return $ do
+                        sendMsg config msg
+                        sendLoop
 
         runLoop :: IO ()
                 -> (SomeException -> ChannelizeException)
@@ -159,7 +166,8 @@ channelize config inner = do
             waitForDelay 1000000 [send_stopped, recv_stopped] $ do
                 throwTo send_tid ChannelizeKill
 
-                -- Give the send thread one more chance to stop, so 'close' hopefully 
+            -- Ensure that no sending or receiving will happen at the same time as connClose.
+            waitFor [send_stopped, recv_stopped]
 
             connClose config `finally` (atomically $ writeTVar killer_stopped True)
 
