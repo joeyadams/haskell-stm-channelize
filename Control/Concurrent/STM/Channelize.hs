@@ -207,7 +207,7 @@ connectHandle h = do
 --
 -- When the inner computation completes (or throws an exception), the send
 -- queue is flushed and the connection is closed.
-channelize :: (IO (ChannelizeConfig msg_in msg_out))
+channelize :: IO (ChannelizeConfig msg_in msg_out)
                 -- ^ Connect action.  It is run inside of an asynchronous
                 --   exception 'mask'.
            -> (TDuplex msg_in msg_out -> IO a)
@@ -264,36 +264,24 @@ channelize connect inner = do
                     Just ChannelizeKill -> writeTVar status_var Stopped
                     _                   -> writeTVar status_var $ Error e
 
-        recver <- forkIO $ recvLoop
+        recver  <- forkIO $ recvLoop
                     `catch` (atomically . setError recv_status)
 
-        sender <- forkIO $ sendLoop
+        _sender <- forkIO $ sendLoop
                     `catch` (atomically . setError send_status)
 
         let finish = do
                 atomically $ writeTVar stop True
-                _ <- forkIO $ killSenderAfter 1000000
-                throwTo recver ChannelizeKill `finally` waitForWorkers
-                                              `finally` connClose config
 
-            killSenderAfter usec = do
-                -- I would use 'registerDelay', but it requires -threaded
-                timeout <- newTVarIO False
-                _ <- forkIO $ do
-                    threadDelay usec
-                    atomically $ writeTVar timeout True
-
-                join $ atomically $ do
-                    s <- readTVar send_status
-                    case s of
-                        Running -> do
-                            t <- readTVar timeout
-                            if t
-                                then return $ throwTo sender ChannelizeKill
-                                else retry
-                        _ ->
-                            -- Sender thread stopped.  Don't kill it.
-                            return $ return ()
+                -- Wait for the sender and receiver threads to finish.  This
+                -- ensures that all enqueued data is sent before 'channelize'
+                -- completes.
+                --
+                -- If we receive any asynchronous exceptions after this point,
+                -- too bad... the connection won't be properly closed.
+                throwTo recver ChannelizeKill
+                waitForWorkers
+                connClose config
 
             waitForWorkers = atomically $ do
                 r <- readTVar recv_status
