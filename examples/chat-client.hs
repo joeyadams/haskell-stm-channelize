@@ -6,8 +6,9 @@ import Network
 main :: IO ()
 main =
     channelize (connectHandle $ connectTo "localhost" $ PortNumber 1234)
-    $ \recv send ->
+    $ \conn ->
         channelize connectStdio
-        $ \recvStdin sendStdin ->
+        $ \stdio ->
             forever $ atomically $
-                (recv >>= sendStdin) `orElse` (recvStdin >>= send)
+                (recv conn >>= send stdio) `orElse`
+                (recv stdio >>= send conn)
