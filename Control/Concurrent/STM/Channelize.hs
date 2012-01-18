@@ -45,6 +45,11 @@ data TDuplex msg_in msg_out
         , tdStop       :: TVar Bool
         }
 
+-- | Read a message from the receive queue.  'retry' if no message is available
+-- yet.
+--
+-- This will throw an exception if the reading thread encountered an error, or
+-- if the connection is closed.
 recv :: TDuplex msg_in msg_out -> STM msg_in
 recv td =
     readTChan (tdRecvChan td) `orElse` do
@@ -54,7 +59,7 @@ recv td =
             Stopped -> throwSTM ChannelizeClosedRecv
             Error e -> throwSTM e
 
--- |
+-- | Write a message to the send queue.
 --
 -- If an error occurred while sending a previous message, or if the connection
 -- is closed, 'send' silently ignores the message and returns.  Rationale:
@@ -108,6 +113,7 @@ data WorkerStatus = Running
                   | Stopped
                   | Error SomeException
 
+-- | Callbacks telling 'channelize' how to use a duplex connection.
 data ChannelizeConfig msg_in msg_out
     = ChannelizeConfig
         { recvMsg   :: IO msg_in
@@ -131,6 +137,10 @@ data ChannelizeConfig msg_in msg_out
             -- completes.
         }
 
+-- | Treat 'stdin' and 'stdout' as a \"connection\", where each message
+-- corresponds to a line.
+--
+-- This sets the buffering mode of 'stdin' and 'stdout' to 'LineBuffering'.
 connectStdio :: IO (ChannelizeConfig String String)
 connectStdio = do
     hSetBuffering stdin LineBuffering
@@ -142,9 +152,27 @@ connectStdio = do
         , connClose = return ()
         }
 
-connectHandle :: IO Handle -> IO (ChannelizeConfig String String)
-connectHandle connect = do
-    h <- connect
+-- | Wrap a duplex 'Handle' in a 'ChannelizeConfig'.  Each message corresponds
+-- to a line.
+--
+-- Example (client):
+--
+--  >let connect = connectTo "localhost" (PortNumber 1234) >>= connectHandle
+--  > in channelize connect $ \duplex -> do
+--  >        ...
+--
+-- Example (Telnet server):
+--
+--  >(handle, host, port) <- accept sock
+--  >putStrLn $ "Accepted connection from " ++ host ++ ":" ++ show port
+--  >
+--  >-- Swallow carriage returns sent by telnet clients
+--  >hSetNewlineMode handle universalNewlineMode
+--  >
+--  >forkIO $ channelize (connectHandle handle) $ \duplex -> do
+--  >    ...
+connectHandle :: Handle -> IO (ChannelizeConfig String String)
+connectHandle h = do
     hSetBuffering h LineBuffering `onException` hClose h
     return ChannelizeConfig
         { recvMsg   = hGetLine h

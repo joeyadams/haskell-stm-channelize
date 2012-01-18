@@ -87,7 +87,7 @@ main = do
         -- Swallow carriage returns sent by telnet clients
         hSetNewlineMode handle universalNewlineMode
 
-        forkIO $ channelize (connectHandle $ return handle) $ \duplex -> do
+        forkIO $ channelize (connectHandle handle) $ \duplex -> do
             atomically $ send duplex "What is your name?"
             name <- atomically $ recv duplex
             if null name
