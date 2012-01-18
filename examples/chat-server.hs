@@ -93,7 +93,7 @@ serveClient clients name duplex me =
             broadcastMessageFrom clients name msg
 
 main :: IO ()
-main = do
+main = withSocketsDo $ do
     clients <- newTVarIO M.empty :: IO ClientMap
     sock <- listenOn $ PortNumber 1234
     putStrLn "Listening on port 1234"

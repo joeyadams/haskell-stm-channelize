@@ -4,7 +4,7 @@ import Control.Monad
 import Network
 
 main :: IO ()
-main =
+main = withSocketsDo $
     let connect = connectTo "localhost" (PortNumber 1234) >>= connectHandle
      in channelize connect      $ \conn ->
         channelize connectStdio $ \stdio ->
