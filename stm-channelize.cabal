@@ -1,7 +1,9 @@
 name:                stm-channelize
 version:             0.1
-synopsis:            Wrap network connection with send/receive channels
--- description:
+synopsis:            Transactional I/O for duplex streams
+description:
+    Turn I/O operations into STM transactions on channels.
+
 license:             BSD3
 license-file:        LICENSE
 author:              Joey Adams
