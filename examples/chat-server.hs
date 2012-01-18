@@ -15,9 +15,12 @@ type ClientMap = TVar (Map Name Client)
 
 data Client
     = Client
-        { clientThreadId    :: ThreadId
-        , clientSend        :: Message -> STM ()
+        { clientSend    :: Message -> STM ()
+        , clientKicked  :: TVar Bool
         }
+
+instance Eq Client where
+    a == b = clientKicked a == clientKicked b
 
 broadcast :: ClientMap -> Message -> STM ()
 broadcast clients msg =
@@ -33,28 +36,27 @@ broadcastMessageFrom clients name msg =
 
 insertClient :: ClientMap -> Name -> (Message -> STM ()) -> IO Client
 insertClient clients name c_send = do
-    tid <- myThreadId
-    let client = Client { clientThreadId = tid
-                        , clientSend     = c_send
+    kicked <- newTVarIO False
+    let client = Client { clientSend    = c_send
+                        , clientKicked  = kicked
                         }
 
-    join $ atomically $ do
+    atomically $ do
         -- Insert the client
         m <- readTVar clients
         writeTVar clients $ M.insert name client m
 
         -- Broadcast that the client has connected.  If another client by the
-        -- same name is connected, kick it.
+        -- same name was present, kick it.
         case M.lookup name m of
-            Nothing -> do
+            Nothing ->
                 broadcastNotice clients $ name ++ " has connected"
-                return $ return ()
             Just victim -> do
                 broadcastNotice clients $
                     name ++ " has connected (kicking previous client)"
                 clientSend victim $
                     "Another client by the name of " ++ name ++ " has connected"
-                return $ killThread $ clientThreadId victim
+                writeTVar (clientKicked victim) True
 
     return client
 
@@ -69,11 +71,26 @@ deleteClient clients name client =
             Just c ->
                 -- Make sure the client in the map is actually me, and not
                 -- another client who took my name.
-                if clientThreadId c == clientThreadId client
+                if c == client
                     then do
                         broadcastNotice clients $ name ++ " has disconnected"
                         writeTVar clients $ M.delete name m
                     else return ()
+
+serveClient :: ClientMap -> Name -> TDuplex Message Message -> Client -> IO ()
+serveClient clients name duplex me =
+        forever $ atomically $
+            check_kicked `orElse` check_recv
+    where
+        check_kicked = do
+            kicked <- readTVar $ clientKicked me
+            if kicked
+                then throwSTM ThreadKilled
+                else retry
+
+        check_recv = do
+            msg <- recv duplex
+            broadcastMessageFrom clients name msg
 
 main :: IO ()
 main = do
@@ -94,5 +111,4 @@ main = do
                 then atomically $ send duplex "Bye, anonymous coward"
                 else bracket (insertClient clients name $ send duplex)
                              (deleteClient clients name)
-                    $ \_ -> forever $ atomically $
-                                recv duplex >>= broadcastMessageFrom clients name
+                             (serveClient  clients name duplex)
