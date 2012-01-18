@@ -79,9 +79,6 @@ recv td =
 
 -- | Write a message to the send queue.
 --
--- This version of Channelize does not limit the size of the send queue.  Thus,
--- 'send' /currently/ does not 'retry'.  However, it may in a future version.
---
 -- If an error occurred while sending a previous message, or if the connection
 -- is closed, 'send' silently ignores the message and returns.  Rationale:
 -- suppose you have threads for clients A and B.  A sends a message to B.  If
