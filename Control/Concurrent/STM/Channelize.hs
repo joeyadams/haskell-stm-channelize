@@ -9,10 +9,21 @@
 
 {-# LANGUAGE CPP, DeriveDataTypeable #-}
 module Control.Concurrent.STM.Channelize (
+    -- * Using TDuplex for transactional I/O
+    TDuplex,
+    recv,
+    send,
+    sendE,
+
+    -- * Configuring a connection
     ChannelizeConfig(..),
     connectStdio,
     connectHandle,
+
+    -- * The channelize function
     channelize,
+
+    -- * Exceptions
     ChannelizeException(..),
 ) where
 
@@ -24,6 +35,51 @@ import Control.Monad
 import Data.IORef
 import Data.Typeable
 import System.IO
+
+data TDuplex msg_in msg_out
+    = TDuplex
+        { tdRecvStatus :: TVar WorkerStatus
+        , tdRecvChan   :: TChan msg_in
+        , tdSendStatus :: TVar WorkerStatus
+        , tdSendChan   :: TChan msg_out
+        }
+
+recv :: TDuplex msg_in msg_out -> STM msg_in
+recv td =
+    readTChan (tdRecvChan td) `orElse` do
+        s <- readTVar $ tdRecvStatus td
+        case s of
+            Running -> retry
+            Stopped -> throwSTM ChannelizeClosedRecv
+            Error e -> throwSTM e
+
+-- |
+--
+-- If an error occurred while sending a previous message, or if the connection
+-- is closed, 'send' silently ignores the message and returns.  Rationale:
+-- suppose you have threads for clients A and B.  A sends a message to B.  If
+-- 'send' threw an exception on failure, you might inadvertently disconnect A
+-- because of a failure that is B's fault.
+send :: TDuplex msg_in msg_out -> msg_out -> STM ()
+send td msg = sendReturnThrow td msg >> return ()
+
+-- | Like 'send', but throw an exception if the message was discarded (either
+-- because 'sendMsg' failed on a previous message, or because the connection
+-- has been closed).
+sendE :: TDuplex msg_in msg_out -> msg_out -> STM ()
+sendE td msg = join $ sendReturnThrow td msg
+
+sendReturnThrow :: TDuplex msg_in msg_out -> msg_out -> STM (STM ())
+sendReturnThrow td msg = do
+    s <- readTVar $ tdSendStatus td
+    case s of
+        Running -> do
+            writeTChan (tdSendChan td) msg
+            return $ return ()
+        Stopped ->
+            return $ throwSTM ChannelizeClosedSend
+        Error e ->
+            return $ throwSTM e
 
 data ChannelizeException
     = ChannelizeClosedRecv
@@ -94,28 +150,22 @@ connectHandle connect = do
 channelize :: (IO (ChannelizeConfig msg_in msg_out))
                 -- ^ Connect action.  It is run inside of an asynchronous
                 --   exception 'mask'.
-           -> (STM msg_in -> (msg_out -> STM ()) -> IO a)
+           -> (TDuplex msg_in msg_out -> IO a)
            -> IO a
 channelize connect inner = do
-    chan_recv   <- newTChanIO
-    chan_send   <- newTChanIO
+    recv_chan   <- newTChanIO
+    send_chan   <- newTChanIO
     stop        <- newTVarIO False
     recv_status <- newTVarIO Running
     send_status <- newTVarIO Running
 
-    let recv = readTChan chan_recv `orElse` do
-            s <- readTVar recv_status
-            case s of
-                Running -> retry
-                Stopped -> throwSTM ChannelizeClosedRecv
-                Error e -> throwSTM e
-
-        send msg = do
-            s <- readTVar send_status
-            case s of
-                Running -> writeTChan chan_send msg
-                Stopped -> throwSTM ChannelizeClosedSend
-                Error e -> throwSTM e
+    let tduplex =
+            TDuplex
+                { tdRecvStatus  = recv_status
+                , tdRecvChan    = recv_chan
+                , tdSendStatus  = send_status
+                , tdSendChan    = send_chan
+                }
 
     mask $ \restore -> do
         config <- connect
@@ -129,7 +179,7 @@ channelize connect inner = do
                             writeTVar recv_status Stopped
                             return $ return ()
                         else do
-                            writeTChan chan_recv msg
+                            writeTChan recv_chan msg
                             return recvLoop
 
             sendLoop = join $ atomically $ do
@@ -139,7 +189,7 @@ channelize connect inner = do
                         sendBye config
                         atomically $ writeTVar send_status Stopped
                     else do
-                        msg <- readTChan chan_send
+                        msg <- readTChan send_chan
                         return $ do
                             sendMsg config msg
                             sendLoop
@@ -188,6 +238,6 @@ channelize connect inner = do
                     (_, Running) -> retry
                     _            -> return ()
 
-        r <- restore (inner recv send) `onException` finish
+        r <- restore (inner tduplex) `onException` finish
         finish
         return r
