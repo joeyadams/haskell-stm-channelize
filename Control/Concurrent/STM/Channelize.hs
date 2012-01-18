@@ -6,9 +6,15 @@
 --
 -- Wrap a network connection such that sending and receiving can be done via
 -- STM transactions.
+--
+-- See 'connectHandle' for basic usage.  See the @examples@ directory of this
+-- package for full examples.
 
 {-# LANGUAGE CPP, DeriveDataTypeable #-}
 module Control.Concurrent.STM.Channelize (
+    -- * The channelize function
+    channelize,
+
     -- * Using TDuplex for transactional I/O
     TDuplex,
     recv,
@@ -19,9 +25,6 @@ module Control.Concurrent.STM.Channelize (
     ChannelizeConfig(..),
     connectStdio,
     connectHandle,
-
-    -- * The channelize function
-    channelize,
 
     -- * Exceptions
     ChannelizeException(..),
@@ -36,6 +39,11 @@ import Data.IORef
 import Data.Typeable
 import System.IO
 
+-- | An abstract object that supports sending and receiving messages in STM.
+--
+-- Internally, it is a pair of 'TChan's, with additional flags to check for I/O
+-- errors on 'recv', and to avoid filling the send queue with messages that
+-- will never be sent.
 data TDuplex msg_in msg_out
     = TDuplex
         { tdRecvStatus :: TVar WorkerStatus
@@ -45,11 +53,21 @@ data TDuplex msg_in msg_out
         , tdStop       :: TVar Bool
         }
 
--- | Read a message from the receive queue.  'retry' if no message is available
--- yet.
---
--- This will throw an exception if the reading thread encountered an error, or
--- if the connection is closed.
+{- |
+Read a message from the receive queue.  'retry' if no message is available yet.
+
+This will throw an exception if the reading thread encountered an error, or if
+the connection is closed.
+
+Remember that STM transactions have no effect until they commit.  Thus, to send
+a message and wait for a response, you will need to use two separate
+transactions:
+
+@
+'atomically' $ 'send' duplex \"What is your name?\"
+name <- 'atomically' $ 'recv' duplex
+@
+-}
 recv :: TDuplex msg_in msg_out -> STM msg_in
 recv td =
     readTChan (tdRecvChan td) `orElse` do
@@ -61,11 +79,14 @@ recv td =
 
 -- | Write a message to the send queue.
 --
+-- This version of Channelize does not limit the size of the send queue.  Thus,
+-- 'send' /currently/ does not 'retry'.  However, it may in a future version.
+--
 -- If an error occurred while sending a previous message, or if the connection
 -- is closed, 'send' silently ignores the message and returns.  Rationale:
 -- suppose you have threads for clients A and B.  A sends a message to B.  If
--- 'send' threw an exception on failure, you might inadvertently disconnect A
--- because of a failure that is B's fault.
+-- 'send' were to throw an exception on failure, you might inadvertently
+-- disconnect A because of a failure that is B's fault.
 send :: TDuplex msg_in msg_out -> msg_out -> STM ()
 send td msg = sendReturnThrow td msg >> return ()
 
@@ -181,10 +202,20 @@ connectHandle h = do
         , connClose = hClose h
         }
 
+-- | Open a connection, and manage it so it can be used as a 'TDuplex'.
+--
+-- This works by spawning two threads, one which receives messages and another
+-- which sends messages.  If the 'recvMsg' callback throws an exception, it
+-- will be forwarded to the next 'recv' call (once the receive queue is empty).
+--
+-- When the inner computation completes (or throws an exception), the send
+-- queue is flushed and the connection is closed.
 channelize :: (IO (ChannelizeConfig msg_in msg_out))
                 -- ^ Connect action.  It is run inside of an asynchronous
                 --   exception 'mask'.
            -> (TDuplex msg_in msg_out -> IO a)
+                -- ^ Inner computation.  When this completes or throws an
+                -- exception, the connection will be closed.
            -> IO a
 channelize connect inner = do
     recv_chan   <- newTChanIO
