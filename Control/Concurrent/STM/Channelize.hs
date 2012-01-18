@@ -42,6 +42,7 @@ data TDuplex msg_in msg_out
         , tdRecvChan   :: TChan msg_in
         , tdSendStatus :: TVar WorkerStatus
         , tdSendChan   :: TChan msg_out
+        , tdStop       :: TVar Bool
         }
 
 recv :: TDuplex msg_in msg_out -> STM msg_in
@@ -74,8 +75,13 @@ sendReturnThrow td msg = do
     s <- readTVar $ tdSendStatus td
     case s of
         Running -> do
-            writeTChan (tdSendChan td) msg
-            return $ return ()
+            stopped <- readTVar (tdStop td)
+            if stopped
+                then
+                    return $ throwSTM ChannelizeClosedSend
+                else do
+                    writeTChan (tdSendChan td) msg
+                    return $ return ()
         Stopped ->
             return $ throwSTM ChannelizeClosedSend
         Error e ->
@@ -165,6 +171,7 @@ channelize connect inner = do
                 , tdRecvChan    = recv_chan
                 , tdSendStatus  = send_status
                 , tdSendChan    = send_chan
+                , tdStop        = stop
                 }
 
     mask $ \restore -> do
@@ -182,17 +189,19 @@ channelize connect inner = do
                             writeTChan recv_chan msg
                             return recvLoop
 
-            sendLoop = join $ atomically $ do
-                s <- readTVar stop
-                if s
-                    then return $ do
-                        sendBye config
-                        atomically $ writeTVar send_status Stopped
-                    else do
-                        msg <- readTChan send_chan
-                        return $ do
-                            sendMsg config msg
-                            sendLoop
+            sendLoop = join $ atomically $
+                (do msg <- readTChan send_chan
+                    return $ do
+                        sendMsg config msg
+                        sendLoop
+                ) `orElse`
+                (do s <- readTVar stop
+                    if s
+                        then return $ do
+                            sendBye config
+                            atomically $ writeTVar send_status Stopped
+                        else retry
+                )
 
             setError status_var e =
                 case fromException e of
