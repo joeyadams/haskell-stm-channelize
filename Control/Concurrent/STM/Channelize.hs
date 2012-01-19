@@ -26,6 +26,11 @@ module Control.Concurrent.STM.Channelize (
     connectStdio,
     connectHandle,
 
+    -- ** Closing individual sides of a duplex Handle
+    -- $closing
+    hCloseRead,
+    hCloseWrite,
+
     -- * Exceptions
     ChannelizeException(..),
 ) where
@@ -38,6 +43,17 @@ import Control.Monad
 import Data.IORef
 import Data.Typeable
 import System.IO
+
+-- Scary imports needed for hCloseRead and hCloseWrite
+import GHC.IO.Handle.Types
+    ( Handle(FileHandle, DuplexHandle)
+    , Handle__
+    )
+import GHC.IO.Handle.Internals
+    ( augmentIOError
+    , hClose_help
+    , withHandle'
+    )
 
 -- | An abstract object that supports sending and receiving messages in STM.
 --
@@ -198,6 +214,45 @@ connectHandle h = do
         , sendBye   = return ()
         , connClose = hClose h
         }
+
+{- $closing
+
+
+
+-}
+
+-- These functions are based on the source code to hClose.  If this code
+-- breaks, look there to see what changed.
+
+-- | Close only the read end of a duplex 'Handle'.
+hCloseRead :: Handle -> IO ()
+hCloseRead (FileHandle _ _) =
+    return ()
+hCloseRead h@(DuplexHandle _ r _) =
+    withAugmentIOError "hCloseRead" h $
+        hClose' h r
+
+-- | Close only the write end of a duplex 'Handle'.
+hCloseWrite :: Handle -> IO ()
+hCloseWrite (FileHandle   _ _) =
+    return ()
+hCloseWrite h@(DuplexHandle _ _ w) =
+    withAugmentIOError "hCloseWrite" h $
+        hClose' h w
+
+withAugmentIOError :: String -> Handle -> IO (Maybe SomeException) -> IO ()
+withAugmentIOError fname h inner =
+    mask $ \restore -> do
+        maybe_ex <- restore inner
+        case maybe_ex of
+            Nothing -> return ()
+            Just e ->
+                case fromException e of
+                    Just ioe -> ioError (augmentIOError ioe fname h)
+                    Nothing  -> throwIO e
+
+hClose' :: Handle -> MVar Handle__ -> IO (Maybe SomeException)
+hClose' h m = withHandle' "hClose" h m hClose_help
 
 -- | Open a connection, and manage it so it can be used as a 'TDuplex'.
 --
