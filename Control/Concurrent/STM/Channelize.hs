@@ -25,6 +25,7 @@ module Control.Concurrent.STM.Channelize (
     ChannelizeConfig(..),
     connectStdio,
     connectHandle,
+    connectHandlePair,
 
     -- ** Closing individual sides of a duplex Handle
     -- $closing
@@ -166,24 +167,43 @@ data ChannelizeConfig msg_in msg_out
             -- ^ Action to call before closing the connection, but only if none
             -- of the send calls failed.  This is called from the same thread
             -- as 'sendMsg'.
+        , recvClose :: IO ()
+        , sendClose :: IO ()
+            -- ^ Close individual ends of the connection.  'recvClose' and
+            -- 'sendClose' are called from the same threads as 'recvMsg' and
+            -- 'sendMsg' respectively.
+            --
+            -- See 'hCloseRead' and 'hCloseWrite'.
         , connClose :: IO ()
             -- ^ Callback for closing the connection.  Called when 'channelize'
-            -- completes.
+            -- completes, after 'recvClose' and 'sendClose' have been called.
         }
 
 -- | Treat 'stdin' and 'stdout' as a \"connection\", where each message
 -- corresponds to a line.
 --
 -- This sets the buffering mode of 'stdin' and 'stdout' to 'LineBuffering'.
+--
+-- Be warned that this closes 'stdin' and 'stdout' upon completion.
 connectStdio :: IO (ChannelizeConfig String String)
-connectStdio = do
-    hSetBuffering stdin LineBuffering
-    hSetBuffering stdout LineBuffering
+connectStdio = connectHandlePair stdin stdout
+
+-- | Like 'connectStdio', but use arbitrary input and output handles.
+--
+-- @'connectStdio' = 'connectHandlePair' 'stdin' 'stdout'@
+connectHandlePair :: Handle     -- ^ Input
+                  -> Handle     -- ^ Output
+                  -> IO (ChannelizeConfig String String)
+connectHandlePair input output = do
+    hSetBuffering input LineBuffering
+    hSetBuffering output LineBuffering
     return ChannelizeConfig
-        { recvMsg   = getLine
-        , sendMsg   = putStrLn
+        { recvMsg   = hGetLine input
+        , sendMsg   = hPutStrLn output
         , sendBye   = return ()
-        , connClose = return ()
+        , recvClose = hClose input
+        , sendClose = hClose output
+        , connClose = hClose output >> hClose input
         }
 
 -- | Wrap a duplex 'Handle' in a 'ChannelizeConfig'.  Each message corresponds
@@ -212,13 +232,23 @@ connectHandle h = do
         { recvMsg   = hGetLine h
         , sendMsg   = hPutStrLn h
         , sendBye   = return ()
+        , recvClose = hCloseRead h
+        , sendClose = hCloseWrite h
         , connClose = hClose h
         }
 
 {- $closing
+Close individual ends of a duplex 'Handle'.  The rationale is that on some
+platforms (namely, Windows with -threaded), a thread blocked reading from a
+'Handle' cannot be interrupted.  This means if two hosts on Windows want to
+disconnect from each other, one of them needs to send EOF first.  'hClose'
+tries to close the read end before trying to close the write end, and 'hClose'
+will block if another thread is using the connection.
 
+'hCloseWrite' makes it possible for the write end to be closed first, allowing
+the receiver to see EOF and close its end, too.
 
-
+'hCloseRead' and 'hCloseWrite' have no effect on file handles.
 -}
 
 -- These functions are based on the source code to hClose.  If this code
@@ -253,6 +283,7 @@ withAugmentIOError fname h inner =
 
 hClose' :: Handle -> MVar Handle__ -> IO (Maybe SomeException)
 hClose' h m = withHandle' "hClose" h m hClose_help
+
 
 -- | Open a connection, and manage it so it can be used as a 'TDuplex'.
 --
