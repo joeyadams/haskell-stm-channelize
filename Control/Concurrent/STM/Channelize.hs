@@ -345,16 +345,22 @@ channelize connect inner = do
                         else retry
                 )
 
-            setError status_var e =
-                case fromException e of
-                    Just ChannelizeKill -> writeTVar status_var Stopped
-                    _                   -> writeTVar status_var $ Error e
+            runLoop x_status x_close x_loop =
+                forkIO $ do
+                    maybe_ex <- try x_loop
+                    case maybe_ex of
+                        Right _ ->
+                            return ()
+                        Left e ->
+                            atomically $ writeTVar x_status $
+                                case fromException e of
+                                    Just ChannelizeKill -> Stopped
+                                    _                   -> Error e
+                    x_close config
+                        `catch` \ChannelizeKill -> x_close config
 
-        recver  <- forkIO $ recvLoop
-                    `catch` (atomically . setError recv_status)
-
-        _sender <- forkIO $ sendLoop
-                    `catch` (atomically . setError send_status)
+        recver  <- runLoop recv_status recvClose recvLoop
+        _sender <- runLoop send_status sendClose sendLoop
 
         let finish = do
                 atomically $ writeTVar stop True
