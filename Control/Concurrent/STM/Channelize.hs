@@ -36,7 +36,7 @@ module Control.Concurrent.STM.Channelize (
     ChannelizeException(..),
 ) where
 
-import Prelude hiding (catch)
+import Prelude hiding (catch, log)
 import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Exception
@@ -177,6 +177,7 @@ data ChannelizeConfig msg_in msg_out
         , connClose :: IO ()
             -- ^ Callback for closing the connection.  Called when 'channelize'
             -- completes, after 'recvClose' and 'sendClose' have been called.
+        , context :: String
         }
 
 -- | Treat 'stdin' and 'stdout' as a \"connection\", where each message
@@ -186,7 +187,9 @@ data ChannelizeConfig msg_in msg_out
 --
 -- Be warned that this closes 'stdin' and 'stdout' upon completion.
 connectStdio :: IO (ChannelizeConfig String String)
-connectStdio = connectHandlePair stdin stdout
+connectStdio = do
+    c <- connectHandlePair stdin stdout
+    return c {context = "connectStdio"}
 
 -- | Like 'connectStdio', but use arbitrary input and output handles.
 --
@@ -201,9 +204,19 @@ connectHandlePair input output = do
         { recvMsg   = hGetLine input
         , sendMsg   = hPutStrLn output
         , sendBye   = return ()
-        , recvClose = hClose input
-        , sendClose = hClose output
-        , connClose = hClose output >> hClose input
+        , recvClose = do
+            hPutStrLn stderr $ "connectHandlePair: hClose input"
+            hClose input
+            hPutStrLn stderr $ "connectHandlePair: hClose input complete"
+        , sendClose = do
+            hPutStrLn stderr $ "connectHandlePair: hClose output"
+            hClose output
+            hPutStrLn stderr $ "connectHandlePair: hClose output complete"
+        , connClose = do
+            hPutStrLn stderr $ "connectHandlePair: connClose"
+            hClose output >> hClose input
+            hPutStrLn stderr $ "connectHandlePair: connClose complete"
+        , context = "connectHandlePair"
         }
 
 -- | Wrap a duplex 'Handle' in a 'ChannelizeConfig'.  Each message corresponds
@@ -228,13 +241,19 @@ connectHandlePair input output = do
 connectHandle :: Handle -> IO (ChannelizeConfig String String)
 connectHandle h = do
     hSetBuffering h LineBuffering `onException` hClose h
+    hSetBuffering stderr LineBuffering
     return ChannelizeConfig
         { recvMsg   = hGetLine h
         , sendMsg   = hPutStrLn h
         , sendBye   = return ()
-        , recvClose = hCloseRead h
-        , sendClose = hCloseWrite h
+        , recvClose = hPutStrLn stderr "connectHandle: hCloseRead"
+                   >> hCloseRead h
+                   >> hPutStrLn stderr "connectHandle: hCloseRead complete"
+        , sendClose = hPutStrLn stderr "connectHandle: hCloseWrite"
+                   >> hCloseWrite h
+                   >> hPutStrLn stderr "connectHandle: hCloseWrite complete"
         , connClose = hClose h
+        , context = "connectHandle"
         }
 
 {- $closing
@@ -320,7 +339,12 @@ channelize connect inner = do
         config <- connect
 
         let recvLoop = do
+                let log msg = uninterruptibleMask_
+                            $ hPutStrLn stderr
+                            $ "recvLoop <" ++ context config ++ ">: " ++ msg
+                log "recvMsg"
                 msg <- recvMsg config
+                log "recvMsg done"
                 join $ atomically $ do
                     s <- readTVar stop
                     if s
@@ -363,6 +387,11 @@ channelize connect inner = do
         _sender <- runLoop send_status sendClose sendLoop
 
         let finish = do
+                let log msg = uninterruptibleMask_
+                            $ hPutStrLn stderr
+                            $ "channelize.finish <" ++ context config ++ ">: " ++ msg
+
+                log "Signalling stop"
                 atomically $ writeTVar stop True
 
                 -- Wait for the sender and receiver threads to finish.  This
@@ -371,9 +400,13 @@ channelize connect inner = do
                 --
                 -- If we receive any asynchronous exceptions after this point,
                 -- too bad... the connection won't be properly closed.
+                log "Killing receiver"
                 throwTo recver ChannelizeKill
+                log "Waiting for workers"
                 waitForWorkers
+                log "Closing connection"
                 connClose config
+                log "Done"
 
             waitForWorkers = atomically $ do
                 r <- readTVar recv_status
