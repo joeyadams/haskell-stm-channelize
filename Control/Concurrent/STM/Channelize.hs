@@ -25,6 +25,7 @@ module Control.Concurrent.STM.Channelize (
     ChannelizeConfig(..),
     connectStdio,
     connectHandle,
+    hGetInterruptible,
 
     -- * Exceptions
     ChannelizeException(..),
@@ -164,8 +165,8 @@ connectStdio = do
     hSetBuffering stdin LineBuffering
     hSetBuffering stdout LineBuffering
     return ChannelizeConfig
-        { recvMsg   = getLine
-        , sendMsg   = putStrLn
+        { recvMsg   = hGetInterruptible hGetLine stdin
+        , sendMsg   = hPutStrLn stdout
         , sendBye   = return ()
         , connClose = return ()
         }
@@ -193,11 +194,43 @@ connectHandle :: Handle -> IO (ChannelizeConfig String String)
 connectHandle h = do
     hSetBuffering h LineBuffering `onException` hClose h
     return ChannelizeConfig
-        { recvMsg   = hGetLine h
+        { recvMsg   = hGetInterruptible hGetLine h
         , sendMsg   = hPutStrLn h
         , sendBye   = return ()
         , connClose = hClose h
         }
+
+-- | Perform a read action on a 'Handle'.  Try to ensure that it can be
+-- interrupted by an asynchronous exception.
+--
+-- On Windows with -threaded, a thread reading a 'Handle' cannot be interrupted
+-- by an asynchronous exception.  The exception will not be delivered until the
+-- receive operation completes or fails.
+--
+-- 'hGetInterruptible' works around this problem (when present) by calling
+-- 'hWaitForInput' over and over with a delay of one second.
+hGetInterruptible :: (Handle -> IO a) -> Handle -> IO a
+#ifdef mingw32_HOST_OS
+
+hGetInterruptible inner h
+    | rtsSupportsBoundThreads
+    = let loop = do
+              ready <- hWaitForInput h 1000
+              if ready
+                  then inner h
+                  else allowInterrupt >> loop
+#if !MIN_VERSION_base(4,4,0)
+          allowInterrupt = unblock $ return ()
+#endif
+       in loop
+    | otherwise
+    = inner h
+
+#else
+
+hGetInterruptible inner h = inner h
+
+#endif
 
 -- | Open a connection, and manage it so it can be used as a 'TDuplex'.
 --

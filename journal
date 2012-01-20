@@ -1,0 +1,19 @@
+Developer Journal
+
+@date Jan 19, 2012
+
+On Windows, when -threaded is disabled, hGetChar h and hWaitForInput h (-1) work exactly as desired: they block until input is available, and can be killed by async exceptions.
+
+When -threaded is enabled, these functions work, but they block async exceptions.
+
+As for hWaitForInput h 10000, when -threaded is enabled, it's pretty safe: it waits for the handle, but stops waiting after a while.  It still blocks async exceptions, but we can still stop it, so life is good.
+
+However, when -threaded is disabled, hWaitForInput with positive time blocks the whole RTS!  Even on Unix!
+
+Thus, on Windows:
+    When -threaded is disabled, wait for input by calling hWaitForInput h (-1)
+    When -threaded is enabled, call hWaitForInput h 1000 repeatedly until the handle unblocks.
+
+If not on Windows, simply call hWaitForInput h (-1).
+
+
